@@ -1426,6 +1426,34 @@ struct Tests {
 		#expect(settings.dimensions?.height == 100)
 	}
 
+	@Test(arguments: [CGSize(width: 1920, height: 1080), CGSize(width: 1080, height: 1920)])
+	func weChatStickerCropStaysInsideSelectionAndKeepsCenter(dimensions: CGSize) throws {
+		let selection = CropRect(x: 0.1, y: 0.2, width: 0.7, height: 0.6)
+		let original = selection.unnormalize(forDimensions: dimensions)
+		let crop = try #require(selection.weChatStickerCrop(in: dimensions))
+		let result = crop.unnormalize(forDimensions: dimensions)
+		#expect(abs(result.width - result.height) < 0.0001)
+		#expect(abs(result.midX - original.midX) < 0.0001)
+		#expect(abs(result.midY - original.midY) < 0.0001)
+		#expect(result.minX >= original.minX - 0.0001)
+		#expect(result.minY >= original.minY - 0.0001)
+		#expect(result.maxX <= original.maxX + 0.0001)
+		#expect(result.maxY <= original.maxY + 0.0001)
+	}
+
+	@Test
+	func weChatStickerPresetKeepsSquareAndRejectsUpscaling() throws {
+		#expect(CropRect.initial.weChatStickerCrop(in: .init(widthHeight: 239)) == nil)
+		#expect(CropRect.initial.weChatStickerCrop(in: .init(widthHeight: 240)) == .initial)
+		let dimensions = Dimensions.pixels(.init(widthHeight: 240), originalSize: .init(widthHeight: 480))
+		#expect(PredefinedSizeItem.selectedPredefinedSize(
+			resizableDimensions: dimensions,
+			predefinedPixelDimensions: [],
+			predefinedPercentDimensions: [],
+			activeDimensionType: .pixels
+		) == .weChatSticker)
+	}
+
 	@Test
 	func croppedSizeWithInitialCropReturnsOriginalDimensions() {
 		let size = CropRect.initial.croppedSize(forDimensions: .init(width: 1920, height: 1080))

@@ -646,7 +646,8 @@ private struct _EditScreen: View {
 			Form {
 				DimensionsSetting(
 					maximumDimensions: croppedMaximumSize,
-					resizableDimensions: $resizableDimensions
+					resizableDimensions: $resizableDimensions,
+					applyWeChatSticker: applyWeChatSticker
 				)
 				SpeedSetting()
 					.padding(.bottom, 6) // Makes the forms have equal height.
@@ -699,12 +700,85 @@ private struct _EditScreen: View {
 		return Int(duration.toTimeInterval * Double(effectiveFrameRate)) >= 2
 	}
 
+	private func applyWeChatSticker() {
+		guard let crop = outputCropRect.weChatStickerCrop(in: metadata.dimensions) else {
+			return
+		}
+		outputCropRect = crop
+		resizableDimensions = .pixels(.init(widthHeight: 240), originalSize: crop.croppedSize(forDimensions: metadata.dimensions))
+	}
+
 	private var croppedMaximumSize: CGSize {
 		guard !outputCropRect.isReset else {
 			return metadata.dimensions
 		}
 
 		return outputCropRect.croppedSize(forDimensions: metadata.dimensions)
+	}
+
+	private func importProject(from file: URL) {
+		guard !isImportingProject else {
+			return
+		}
+		isImportingProject = true
+		projectImportGeneration = UUID()
+		Task {
+			defer { isImportingProject = false }
+			let access = file.startAccessingSecurityScopedResource()
+			defer { if access { file.stopAccessingSecurityScopedResource() } }
+			do {
+				let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+				guard size <= 16 * 1024 * 1024 else { throw CocoaError(.fileReadTooLarge) }
+				let project = try GIFProject.decode(Data(contentsOf: file))
+				try await project.validate(sourceURL: url, metadata: metadata)
+				let settings = project.settings
+				let adjustedAsset: AVAsset
+				if settings.speed == 1 {
+					adjustedAsset = asset
+				} else {
+					guard let track = try await asset.firstVideoTrack,
+						let changed = try await track.extractToNewAssetAndChangeSpeed(to: settings.speed) else {
+						throw GIFGenerator.Error.unreadableFile
+					}
+					adjustedAsset = changed
+				}
+				let composition = try await PreviewableComposition(asset: adjustedAsset)
+				let assetRange = try await composition.firstVideoTrack?.load(.timeRange)
+				try Task.checkCancellation()
+				guard appState.isOnEditScreen else {
+					return
+				}
+				await estimatedFileSizeModel.cancel()
+				await fullPreviewStream.cancelFullPreviewGeneration(invalidatingThrough: nextBackgroundWorkRequestID())
+				lastSpeed = settings.speed
+				modifiedAsset = composition
+				modifiedAssetTimeRange = assetRange
+				Defaults[.outputSpeed] = settings.speed
+				outputQuality = settings.quality
+				frameRate = settings.frameRate
+				bounceGIF = settings.bounce
+				loopDelay = settings.loopDelay
+				switch settings.loop {
+				case .forever:
+					loopGIF = true
+					loopCount = 0
+				case .never:
+					loopGIF = false
+					loopCount = 0
+				case .count(let count):
+					loopGIF = false
+					loopCount = count
+				}
+				outputCropRect = settings.crop?.cropRect ?? .initial
+				resizableDimensions = .pixels(.init(width: settings.width, height: settings.height), originalSize: croppedMaximumSize)
+				timeRange = settings.adjustedTrim.range
+				requestedProjectTrim = .init(range: settings.adjustedTrim.range)
+				textSession.loadProjectOverlays(settings.textOverlays)
+				importedProject = project
+				isImportingProject = false
+				updateBackgroundWorkOnSettingsChange()
+			} catch { appState.error = error }
+		}
 	}
 
 	private func convert(skipLargeGIFWarning: Bool = false) {
@@ -826,6 +900,7 @@ private struct _EditScreen: View {
 
 enum PredefinedSizeItem: Hashable {
 	case custom
+	case weChatSticker
 	case dimensions(Dimensions)
 
 	static func selectedPredefinedSize(
@@ -837,6 +912,12 @@ enum PredefinedSizeItem: Hashable {
 	) -> Self {
 		if forceCustom {
 			return .custom
+		}
+
+		if activeDimensionType == .pixels,
+			resizableDimensions.pixels == CGSize(widthHeight: 240),
+			resizableDimensions.originalSize.width == resizableDimensions.originalSize.height {
+			return .weChatSticker
 		}
 
 		switch activeDimensionType {
@@ -881,6 +962,7 @@ private struct DimensionsSetting: View {
 
 	let maximumDimensions: CGSize
 	@Binding var resizableDimensions: Dimensions // TODO: Rename.
+	let applyWeChatSticker: () -> Void
 
 	var body: some View {
 		VStack(spacing: 16) {
@@ -896,6 +978,9 @@ private struct DimensionsSetting: View {
 					Text("Custom — \(string)")
 						.tag(PredefinedSizeItem.custom)
 				}
+				Text("240 × 240 · WeChat Sticker")
+					.tag(PredefinedSizeItem.weChatSticker)
+					.disabled(min(maximumDimensions.width, maximumDimensions.height) < 240)
 				Section("Pixel sizes") {
 					ForEach(predefinedPixelDimensions, id: \.self) { dimensions in
 						let predefinedSize = PredefinedSizeItem.dimensions(dimensions)
@@ -1024,9 +1109,9 @@ private struct DimensionsSetting: View {
 	}
 
 	private func setUpDimensions() {
-		let dimensions = Dimensions.pixels(maximumDimensions, originalSize: maximumDimensions)
-
-		resizableDimensions = dimensions
+		// This control is recreated after text editing. Preserve the document's
+		// output size instead of silently restoring the full source resolution.
+		dimensionsType = resizableDimensions.isPercent ? .percent : .pixels
 		updatePredefinedDimensions()
 	}
 
@@ -1081,6 +1166,13 @@ private struct DimensionsSetting: View {
 	}
 
 	private func updateDimensionsBasedOnSelection(_ selectedSize: PredefinedSizeItem) {
+		if selectedSize == .weChatSticker {
+			dimensionsType = .pixels
+			applyWeChatSticker()
+			synchronizeTextFieldsWithCurrentDimensions()
+			return
+		}
+
 		guard case .dimensions(let dimensions) = selectedSize else {
 			synchronizeTextFieldsWithCurrentDimensions()
 			return

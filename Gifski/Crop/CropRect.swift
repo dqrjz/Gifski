@@ -698,3 +698,21 @@ extension DragGesture.Value {
 		)
 	}
 }
+
+
+extension CropRect {
+	/// Keeps the selected region's center and fits a square inside it without upscaling.
+	func weChatStickerCrop(in dimensions: CGSize) -> Self? {
+		let rect = unnormalize(forDimensions: dimensions)
+		let side = min(rect.width, rect.height)
+		guard side.isFinite, side >= 240, dimensions.width > 0, dimensions.height > 0 else {
+			return nil
+		}
+		return Self(
+			x: (rect.midX - side / 2) / dimensions.width,
+			y: (rect.midY - side / 2) / dimensions.height,
+			width: side / dimensions.width,
+			height: side / dimensions.height
+		)
+	}
+}
