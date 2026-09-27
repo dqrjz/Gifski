@@ -768,6 +768,166 @@ struct Tests {
 	}
 
 	@Test
+	func textCompositingPreservesUncoveredVideoPixels() async throws {
+		let url = try await makeTestVideo(frameCount: 3, dimensions: (320, 180)) { _ in
+			try makeAsymmetricTextTestBuffer()
+		}
+		let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+		let image = try await generator.image(at: .zero).image
+		let layer = try #require(try TextOverlayRenderer.render([TextOverlay(text: "怎么回事")], width: 320, height: 180))
+		let output = try TextOverlayRenderer.composite(layer, onto: image)
+		let originalPixels = try image.pixels(as: .rgba, premultiplyAlpha: false).bytes
+		let outputPixels = try output.pixels(as: .rgba, premultiplyAlpha: false).bytes
+		let textPixels = try layer.image.pixels(as: .rgba, premultiplyAlpha: false).bytes
+		var changedOutsideText = 0
+		var changedInsideText = 0
+		for offset in stride(from: 0, to: originalPixels.count, by: 4) {
+			guard originalPixels[offset..<(offset + 4)] != outputPixels[offset..<(offset + 4)] else { continue }
+			if textPixels[offset + 3] == 0 {
+				changedOutsideText += 1
+			} else {
+				changedInsideText += 1
+			}
+		}
+		#expect(changedOutsideText == 0)
+		#expect(changedInsideText > 100)
+	}
+
+	private func textTestPixels(_ image: CGImage) throws -> [UInt8] {
+		let context = try #require(CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+		context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+		let raw = try #require(context.data).assumingMemoryBound(to: UInt8.self)
+		return Array(UnsafeBufferPointer(start: raw, count: image.width * image.height * 4))
+	}
+
+	private func makeAsymmetricTextTestBuffer() throws -> CVPixelBuffer {
+		var buffer: CVPixelBuffer?
+		try #require(CVPixelBufferCreate(nil, 320, 180, kCVPixelFormatType_32BGRA, nil, &buffer) == kCVReturnSuccess)
+		let result = try #require(buffer)
+		CVPixelBufferLockBaseAddress(result, [])
+		defer { CVPixelBufferUnlockBaseAddress(result, []) }
+		let raw = try #require(CVPixelBufferGetBaseAddress(result)).assumingMemoryBound(to: UInt8.self)
+		let stride = CVPixelBufferGetBytesPerRow(result)
+		for y in 0..<180 {
+			for x in 0..<320 {
+				let offset = y * stride + x * 4
+				raw[offset] = x < 160 ? 20 : 120
+				raw[offset + 1] = 20
+				raw[offset + 2] = x < 160 ? 120 : 20
+				raw[offset + 3] = 255
+			}
+		}
+		return result
+	}
+
+	@Test(arguments: [false, true])
+	func multipleTextLayersRespectRotatedVideoAndCrop(rotated: Bool) async throws {
+		let transform = rotated ? CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 180, ty: 0) : .identity
+		let url = try await makeTestVideo(frameCount: 3, dimensions: (320, 180), transform: transform) { _ in
+			try makeAsymmetricTextTestBuffer()
+		}
+		defer { try? url.deletingLastPathComponent().delete() }
+		let asset = AVURLAsset(url: url)
+		let track = try #require(try await asset.firstVideoTrack)
+		let loadedTransform = try await track.load(.preferredTransform)
+		#expect(loadedTransform == transform)
+		let dimensions = rotated ? (width: 180, height: 320) : (width: 320, height: 180)
+		let upper = TextOverlay(text: "上 Top", normalizedCenter: .init(x: 0.5, y: 0.25), normalizedFontSize: 0.12)
+		var lower = TextOverlay(text: "下 Bottom", normalizedCenter: .init(x: 0.5, y: 0.75), normalizedFontSize: 0.12)
+		lower.fillRGBA = .init(red: 1, green: 1, blue: 0)
+		let conversion = GIFGenerator.Conversion(asset: asset, sourceURL: url, timeRange: 0...1, quality: 1, dimensions: dimensions, frameRate: 2, loop: .never, bounce: false, crop: .init(x: 0.25, y: 0.25, width: 0.5, height: 0.5), textOverlays: [upper, lower])
+		let data = try await GIFGenerator.run(conversion) { _ in }
+		let decoded = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+		let image = try #require(CGImageSourceCreateImageAtIndex(decoded, 0, nil))
+		#expect(image.width == dimensions.width && image.height == dimensions.height)
+		let pixels = try textTestPixels(image)
+		let white = stride(from: 0, to: pixels.count, by: 4).filter { pixels[$0] > 230 && pixels[$0 + 1] > 230 && pixels[$0 + 2] > 230 }
+		let yellow = stride(from: 0, to: pixels.count, by: 4).filter { pixels[$0] > 230 && pixels[$0 + 1] > 230 && pixels[$0 + 2] < 30 }
+		#expect(white.count > 100 && yellow.count > 100)
+		#expect(white.allSatisfy { ($0 / 4) / image.width < image.height / 2 })
+		#expect(yellow.allSatisfy { ($0 / 4) / image.width > image.height / 2 })
+		let upperRight = (5 * image.width + image.width - 6) * 4
+		let lowerLeft = ((image.height - 6) * image.width + 5) * 4
+		// Source left/right red-blue split becomes a top/bottom split when the track rotates.
+		#expect(rotated ? pixels[upperRight] > pixels[upperRight + 2] : pixels[upperRight] < pixels[upperRight + 2])
+		#expect(rotated ? pixels[lowerLeft] < pixels[lowerLeft + 2] : pixels[lowerLeft] > pixels[lowerLeft + 2])
+	}
+
+	@Test
+	func textOnTransparentVideoPreservesTransparentCorners() async throws {
+		let url = try await makeTestVideo(frameCount: 3, codec: .proRes4444) { _ in try makeTransparentPixelBuffer() }
+		defer { try? url.deletingLastPathComponent().delete() }
+		let text = TextOverlay(text: "透明", normalizedCenter: .init(x: 0.75, y: 0.5), normalizedBoxWidth: 0.45, normalizedFontSize: 0.22)
+		let conversion = GIFGenerator.Conversion(asset: AVURLAsset(url: url), sourceURL: url, quality: 1, dimensions: (320, 180), frameRate: 2, loop: .never, bounce: false, textOverlays: [text])
+		let data = try await GIFGenerator.run(conversion) { _ in }
+		let decoded = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+		let image = try #require(CGImageSourceCreateImageAtIndex(decoded, 0, nil))
+		let pixels = try textTestPixels(image)
+		#expect(pixels[3] == 255)
+		#expect(pixels[pixels.count - 1] == 0)
+		let rightHalfWhite = stride(from: 0, to: pixels.count, by: 4).filter {
+			($0 / 4) % image.width > image.width / 2 && pixels[$0] > 230 && pixels[$0 + 1] > 230 && pixels[$0 + 2] > 230 && pixels[$0 + 3] == 255
+		}
+		#expect(rightHalfWhite.count > 100)
+	}
+
+	@Test(arguments: [false, true])
+	func gifTextSurvivesRealVideoCropAndBounce(bounce: Bool) async throws {
+		let videoURL = try await makeTestVideo(frameCount: 4) { frame in
+			try makePixelBuffer(red: 20, green: UInt8(40 + frame * 20), blue: 120)
+		}
+		defer { try? videoURL.deletingLastPathComponent().delete() }
+		var settings = GIFGenerator.Conversion(
+			asset: AVURLAsset(url: videoURL),
+			sourceURL: videoURL,
+			timeRange: 0...1.5,
+			quality: 1,
+			dimensions: (320, 180),
+			frameRate: 2,
+			loop: .never,
+			bounce: bounce,
+			crop: .init(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+		)
+		let baseline = try await GIFGenerator.run(settings) { _ in }
+		settings.textOverlays = [TextOverlay(text: "中文测试", normalizedCenter: .init(x: 0.5, y: 0.25), normalizedFontSize: 0.2)]
+		let data = try await GIFGenerator.run(settings) { _ in }
+		let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
+		#expect(CGImageSourceGetCount(source) == (try gifFrameCount(baseline)))
+		for index in 0..<CGImageSourceGetCount(source) {
+			let image = try #require(CGImageSourceCreateImageAtIndex(source, index, nil))
+			#expect(image.width == 320 && image.height == 180)
+			let context = try #require(CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+			context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+			let raw = try #require(context.data).assumingMemoryBound(to: UInt8.self)
+			let white = stride(from: 0, to: image.width * image.height * 4, by: 4).filter { raw[$0] > 230 && raw[$0 + 1] > 230 && raw[$0 + 2] > 230 }
+			#expect(white.count > 100)
+			#expect(white.allSatisfy { ($0 / 4) / image.width < image.height / 2 })
+		}
+		// Reusing a generator for a later text-free conversion must not retain its text layer.
+		let generator = GIFGenerator()
+		_ = try await generator.run(settings) { _ in }
+		settings.textOverlays = []
+		let withoutText = try await generator.run(settings) { _ in }
+		#expect(withoutText != data)
+	}
+
+	@Test
+	func gifEstimationIncludesText() async throws {
+		let videoURL = try await makeTestVideo(frameCount: 30) { frame in
+			try makePixelBuffer(red: UInt8(frame), green: 40, blue: 100)
+		}
+		defer { try? videoURL.deletingLastPathComponent().delete() }
+		var settings = GIFGenerator.Conversion(asset: AVURLAsset(url: videoURL), sourceURL: videoURL, quality: 1, dimensions: (320, 180), frameRate: 2, loop: .never, bounce: false, textOverlays: [TextOverlay(text: "估算包含文字")])
+		let data = try await GIFGenerator.run(settings, isEstimation: true) { _ in }
+		#expect(try gifFrameCount(data) > 0)
+		settings.textOverlays = []
+		let plain = try await GIFGenerator.run(settings, isEstimation: true) { _ in }
+		let withTextRed = try averageRedValue(gifData: data, frameIndex: 0)
+		let plainRed = try averageRedValue(gifData: plain, frameIndex: 0)
+		#expect(withTextRed > plainRed + 1)
+	}
+
+	@Test
 	func gifGenerationWithBounceProducesCorrectFrameCount() async throws {
 		let videoURL = try await makeTestVideo()
 		defer {

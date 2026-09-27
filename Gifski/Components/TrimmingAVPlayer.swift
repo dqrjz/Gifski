@@ -2,6 +2,11 @@ import AVKit
 import SwiftUI
 
 struct TrimmingAVPlayer: NSViewControllerRepresentable {
+	struct TimeRangeRequest: Equatable {
+		var id = UUID()
+		let range: ClosedRange<Double>
+	}
+
 	typealias NSViewControllerType = TrimmingAVPlayerViewController
 
 	@Environment(\.colorScheme) private var colorScheme
@@ -15,7 +20,8 @@ struct TrimmingAVPlayer: NSViewControllerRepresentable {
 	var speed = 1.0
 	var overlay: NSView?
 	var isPlayPauseButtonEnabled = true
-	var isTrimmerCollapsible = false
+	var isTimelineEnabled = true
+	var requestedTimeRange: TimeRangeRequest?
 	var timeRangeDidChange: ((ClosedRange<Double>) -> Void)?
 
 	func makeNSViewController(context: Context) -> NSViewControllerType {
@@ -27,6 +33,8 @@ struct TrimmingAVPlayer: NSViewControllerRepresentable {
 	}
 
 	func updateNSViewController(_ nsViewController: NSViewControllerType, context: Context) {
+		nsViewController.receiveTimeRangeRequest(requestedTimeRange)
+
 		if asset != nsViewController.currentItem.asset {
 			let item = AVPlayerItem(asset: asset)
 			forceAVPlayerToRedraw(item: item)
@@ -55,8 +63,9 @@ struct TrimmingAVPlayer: NSViewControllerRepresentable {
 			nsViewController.player.rate = nsViewController.player.rate > 0 ? Float(speed) : -Float(speed)
 		}
 		nsViewController.overlay = overlay
-		nsViewController.isTrimmerCollapsible = isTrimmerCollapsible
+		nsViewController.isTimelineEnabled = isTimelineEnabled
 		nsViewController.isPlayPauseButtonEnabled = isPlayPauseButtonEnabled
+		nsViewController.applyRequestedTimeRangeIfReady()
 	}
 
 	/**
@@ -121,8 +130,16 @@ final class TrimmingAVPlayerViewController: NSViewController {
 	private let timeRangeDidChange: ((ClosedRange<Double>) -> Void)?
 	private var cancellables = Set<AnyCancellable>()
 	private var currentItemDurationRange: ClosedRange<Double>?
+	private var pendingTimeRangeRequest: TrimmingAVPlayer.TimeRangeRequest?
+	private var lastTimeRangeRequestID: UUID?
+	private var isTrimmerReady = false
+	private var isApplyingTimeRangeRequest = false
 
-	private var overlayContainer: OverlayContainerView?
+
+	let playerView = TrimmingAVPlayerView()
+	private let timelineView = FixedTimelineView()
+	private var nativeTimelineBar: NSView?
+
 
 	fileprivate var overlay: NSView? {
 		didSet {
@@ -135,84 +152,69 @@ final class TrimmingAVPlayerViewController: NSViewController {
 		}
 	}
 
-	fileprivate var isTrimmerCollapsible = false {
+	fileprivate var isTimelineEnabled = true {
 		didSet {
-			guard isTrimmerCollapsible != oldValue else {
-				return
-			}
-
-			if !isTrimmerCollapsible {
-				overlayContainer?.removeFromSuperview()
-				overlayContainer = nil
-			}
-
-			// Place overlay first so the container is created before the toggle button,
-			// ensuring the button is always on top in the z-order.
-			placeOverlay()
-			collapsibleTrimmer?.isCollapsible = isTrimmerCollapsible
+			updateTimelineInteraction()
 		}
 	}
 
-	/**
-	Places the overlay in the correct layer based on crop mode.
+	private func updateTimelineInteraction() {
+		timelineView.isInteractionEnabled = isTimelineEnabled
+		playerView.isTimelineInteractionEnabled = isTimelineEnabled
+		playerView.setPlayPauseButton(isEnabled: isTimelineEnabled && isPlayPauseButtonEnabled)
+		if !isTimelineEnabled,
+			let responder = view.window?.firstResponder as? NSView,
+			responder.isDescendant(of: timelineView)
+		{
+			view.window?.makeFirstResponder(nil)
+		}
+	}
 
-	When cropping, the overlay goes on `playerView` (via a container) so crop handles sit above the player controls. Hit testing passes through to the trimmer area.
-
-	When not cropping, the overlay goes on `contentOverlayView` (behind controls) so the trimmer is fully accessible.
-	*/
+	/// The preview and timeline are separate siblings, so all overlay coordinates
+	/// are relative to the actual video area and never include the controls below.
 	private func placeOverlay() {
-		guard let overlay else {
+		guard let overlay, let parent = playerView.contentOverlayView else {
+			return
+		}
+		if overlay.superview !== parent {
+			overlay.removeFromSuperview()
+			overlay.translatesAutoresizingMaskIntoConstraints = true
+			overlay.autoresizingMask = []
+			parent.addSubview(overlay)
+		}
+		let frame = parent.convert(playerView.videoBounds, from: playerView)
+		if overlay.frame != frame {
+			overlay.frame = frame
+		}
+	}
+
+	private func installTimelineIfNeeded() {
+		guard
+			let trimView = playerView.firstSubview(deep: true, where: { $0.simpleClassName == "AVTrimView" }),
+			let bar = trimView.superview?.superview?.superview,
+			bar !== playerView,
+			bar.isDescendant(of: playerView)
+		else {
 			return
 		}
 
-		overlay.removeFromSuperview()
-		overlay.removeConstraints(overlay.constraints)
-
-		if isTrimmerCollapsible {
-			if overlayContainer == nil {
-				let container = OverlayContainerView()
-				container.passthroughView = _collapsibleTrimmer?.trimmerWrapper
-				playerView.addSubview(container)
-				container.translatesAutoresizingMaskIntoConstraints = false
-				NSLayoutConstraint.activate([
-					container.leadingAnchor.constraint(equalTo: playerView.leadingAnchor),
-					container.topAnchor.constraint(equalTo: playerView.topAnchor),
-					container.trailingAnchor.constraint(equalTo: playerView.trailingAnchor),
-					container.bottomAnchor.constraint(equalTo: playerView.bottomAnchor)
-				])
-				overlayContainer = container
-			}
-
-			guard let overlayContainer else {
-				return
-			}
-
-			overlayContainer.addSubview(overlay)
-			overlay.translatesAutoresizingMaskIntoConstraints = false
-
-			let videoBounds = playerView.videoBounds
-			NSLayoutConstraint.activate([
-				overlay.leadingAnchor.constraint(equalTo: overlayContainer.leadingAnchor, constant: videoBounds.origin.x),
-				overlay.topAnchor.constraint(equalTo: overlayContainer.topAnchor, constant: videoBounds.origin.y),
-				overlay.widthAnchor.constraint(equalToConstant: videoBounds.size.width),
-				overlay.heightAnchor.constraint(equalToConstant: videoBounds.size.height)
-			])
-		} else {
-			guard let contentOverlayView = playerView.contentOverlayView else {
-				return
-			}
-
-			let videoBounds = playerView.videoBounds
-
-			contentOverlayView.addSubview(overlay)
-			overlay.translatesAutoresizingMaskIntoConstraints = false
-			NSLayoutConstraint.activate([
-				overlay.leadingAnchor.constraint(equalTo: contentOverlayView.leadingAnchor, constant: videoBounds.origin.x),
-				overlay.topAnchor.constraint(equalTo: contentOverlayView.topAnchor, constant: videoBounds.origin.y),
-				overlay.widthAnchor.constraint(equalToConstant: videoBounds.size.width),
-				overlay.heightAnchor.constraint(equalToConstant: videoBounds.size.height)
-			])
-		}
+		// Keep AVKit's complete controls subtree and all its internal constraints,
+		// actions, thumbnail generation and accessibility elements intact.
+		let height = bar.getConstraintConstantFromSuperView(attribute: .height) ?? 64
+		timelineView.restoreInteractionState()
+		nativeTimelineBar?.removeFromSuperview()
+		bar.removeFromSuperview()
+		bar.translatesAutoresizingMaskIntoConstraints = false
+		timelineView.addSubview(bar)
+		NSLayoutConstraint.activate([
+			bar.leadingAnchor.constraint(equalTo: timelineView.leadingAnchor, constant: 6),
+			bar.trailingAnchor.constraint(equalTo: timelineView.trailingAnchor, constant: -6),
+			bar.centerYAnchor.constraint(equalTo: timelineView.centerYAnchor),
+			bar.heightAnchor.constraint(equalToConstant: min(64, max(1, height)))
+		])
+		nativeTimelineBar = bar
+		playerView.detachedTimelineView = timelineView
+		updateTimelineInteraction()
 	}
 
 	fileprivate var isPlayPauseButtonEnabled = true {
@@ -221,40 +223,8 @@ final class TrimmingAVPlayerViewController: NSViewController {
 				return
 			}
 
-			playerView.setPlayPauseButton(isEnabled: isPlayPauseButtonEnabled)
+			playerView.setPlayPauseButton(isEnabled: isTimelineEnabled && isPlayPauseButtonEnabled)
 		}
-	}
-
-	var playerView: TrimmingAVPlayerView { view as! TrimmingAVPlayerView }
-
-	// We cannot use lazy here because at start this will be `nil` before the player is initialized (there won't be an AVTrimView).
-	private var _collapsibleTrimmer: CollapsibleTrimmer?
-
-	private var collapsibleTrimmer: CollapsibleTrimmer? {
-		if let _collapsibleTrimmer {
-			return _collapsibleTrimmer
-		}
-
-		// Needed so that it will hide the trimmer when it is outside the view. This must be done now (as opposed to `viewDidLoad`) because layer is nil in `viewDidLoad`.
-		playerView.layer?.masksToBounds = true
-
-		guard
-			let avTrimView = (playerView.firstSubview(deep: true) { $0.simpleClassName == "AVTrimView" })?.superview,
-			let avTrimViewParent = avTrimView.superview?.superview
-		else {
-			return nil
-		}
-
-		let trimmer = CollapsibleTrimmer(
-			avTrimView: avTrimView,
-			avTrimViewParent: avTrimViewParent,
-			playerView: playerView
-		)
-
-		overlayContainer?.passthroughView = trimmer.trimmerWrapper
-
-		_collapsibleTrimmer = trimmer
-		return trimmer
 	}
 
 	/**
@@ -292,12 +262,22 @@ final class TrimmingAVPlayerViewController: NSViewController {
 			let playbackPercentage = player.currentItem?.playbackProgress ?? 0
 			let playbackRangePercentage = player.currentItem?.playbackRangePercentage
 
+			isTrimmerReady = false
 			player.replaceCurrentItem(with: newValue)
 
-			DispatchQueue.main.async { [self] in
+			let requestID = lastTimeRangeRequestID
+			let hasPendingRequest = pendingTimeRangeRequest != nil
+			DispatchQueue.main.async { [weak self, weak newValue] in
+				guard let self, let newValue, player.currentItem === newValue else {
+					return
+				}
 				player.rate = rate
-				player.currentItem?.seek(toPercentage: playbackPercentage)
-				player.currentItem?.playbackRangePercentage = playbackRangePercentage
+				// A project import supersedes the old item's trim and playhead.
+				guard !hasPendingRequest, pendingTimeRangeRequest == nil, lastTimeRangeRequestID == requestID else {
+					return
+				}
+				newValue.seek(toPercentage: playbackPercentage)
+				newValue.playbackRangePercentage = playbackRangePercentage
 			}
 		}
 	}
@@ -324,11 +304,29 @@ final class TrimmingAVPlayerViewController: NSViewController {
 	}
 
 	override func loadView() {
-		let playerView = TrimmingAVPlayerView()
+		let container = NSView()
+		container.addSubview(playerView)
+		container.addSubview(timelineView)
+		playerView.translatesAutoresizingMaskIntoConstraints = false
+		timelineView.translatesAutoresizingMaskIntoConstraints = false
+		NSLayoutConstraint.activate([
+			playerView.topAnchor.constraint(equalTo: container.topAnchor),
+			playerView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+			playerView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+			playerView.bottomAnchor.constraint(equalTo: timelineView.topAnchor),
+			timelineView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+			timelineView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+			timelineView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+			timelineView.heightAnchor.constraint(equalToConstant: 76)
+		])
+		playerView.onVideoBoundsChange = { [weak self] in
+			self?.installTimelineIfNeeded()
+			self?.placeOverlay()
+		}
 		playerView.allowsVideoFrameAnalysis = false
 		playerView.controlsStyle = controlsStyle
 		playerView.player = player
-		view = playerView
+		view = container
 	}
 
 	override func viewDidLoad() {
@@ -344,22 +342,76 @@ final class TrimmingAVPlayerViewController: NSViewController {
 					.map { _ in currentItem }
 			}
 			.receive(on: DispatchQueue.main)
-			.sink { [weak self] in
-				guard let self else {
+			.sink { [weak self] item in
+				guard let self, player.currentItem === item else {
 					return
 				}
 
-				playerView.setupTrimmingObserver()
+				if pendingTimeRangeRequest == nil {
+					onNewDurationRange(durationRange: item.durationRange)
+				} else {
+					currentItemDurationRange = item.durationRange
+				}
 
-				onNewDurationRange(durationRange: $0.durationRange)
-
-				// This is here as it needs to be refreshed when the current item changes.
-				playerView.observeTrimmedTimeRange { [weak self] timeRange in
-					self?.timeRange = timeRange
-					self?.timeRangeDidChange?(timeRange)
+				// Ignore initialization changes until the requested project range is installed.
+				playerView.observeTrimmedTimeRange { [weak self, weak item] timeRange in
+					guard let self, let item, player.currentItem === item,
+						pendingTimeRangeRequest == nil, !isApplyingTimeRangeRequest
+					else {
+						return
+					}
+					self.timeRange = timeRange
+					timeRangeDidChange?(timeRange)
+				}
+				playerView.setupTrimmingObserver { [weak self, weak item] in
+					guard let self, let item, player.currentItem === item else {
+						return
+					}
+					installTimelineIfNeeded()
+					isTrimmerReady = true
+					applyRequestedTimeRangeIfReady()
 				}
 			}
 			.store(in: &cancellables)
+	}
+
+	fileprivate func receiveTimeRangeRequest(_ request: TrimmingAVPlayer.TimeRangeRequest?) {
+		guard let request, request.id != lastTimeRangeRequestID else {
+			return
+		}
+		lastTimeRangeRequestID = request.id
+		pendingTimeRangeRequest = request
+	}
+
+	fileprivate func applyRequestedTimeRangeIfReady() {
+		guard let request = pendingTimeRangeRequest,
+			currentItem.status == .readyToPlay, isTrimmerReady,
+			let durationRange = currentItem.durationRange
+		else {
+			return
+		}
+		let range = request.range
+		guard range.lowerBound.isFinite, range.upperBound.isFinite,
+			range.lowerBound >= durationRange.lowerBound,
+			range.upperBound <= durationRange.upperBound,
+			range.lowerBound < range.upperBound
+		else {
+			pendingTimeRangeRequest = nil
+			return
+		}
+
+		isApplyingTimeRangeRequest = true
+		// Preserve imported fractional timestamps instead of rounding to the
+		// 1/600-second convenience setter used by interactive trimming.
+		currentItem.forwardPlaybackEndTime = CMTime(seconds: range.upperBound, preferredTimescale: 1_000_000_000)
+		currentItem.reversePlaybackEndTime = CMTime(seconds: range.lowerBound, preferredTimescale: 1_000_000_000)
+		currentItem.seek(to: currentItem.reversePlaybackEndTime, toleranceBefore: .zero, toleranceAfter: .zero)
+		currentItemDurationRange = durationRange
+		timeRange = range
+		pendingTimeRangeRequest = nil
+		isApplyingTimeRangeRequest = false
+		playerView.needsLayout = true
+		timeRangeDidChange?(range)
 	}
 
 	func onNewDurationRange(durationRange newItemDurationRange: ClosedRange<Double>?) {
@@ -389,6 +441,17 @@ final class TrimmingAVPlayerView: AVPlayerView {
 	private var trimmingCancellable: AnyCancellable?
 	private var readyForDisplayCancellable: AnyCancellable?
 	private var checkerboardVideoBounds: CGRect?
+	private var checkerboardContainerBounds: CGRect?
+	private var pendingOverlayRefresh = false
+	fileprivate var onVideoBoundsChange: (() -> Void)?
+	fileprivate weak var detachedTimelineView: NSView?
+	fileprivate var isTimelineInteractionEnabled = true
+
+	private var nativeTrimView: NSView? {
+		firstSubview(deep: true) { $0.simpleClassName == "AVTrimView" }
+			?? detachedTimelineView?.firstSubview(deep: true) { $0.simpleClassName == "AVTrimView" }
+	}
+
 
 	/**
 	The minimum duration the trimmer can be set to.
@@ -403,6 +466,22 @@ final class TrimmingAVPlayerView: AVPlayerView {
 		super.layout()
 
 		updateCheckerboardViewIfNeeded()
+		onVideoBoundsChange?()
+
+		// AVKit can finish laying out its internal video layer after this view's
+		// layout callback. Refresh both overlays once that pass has completed.
+		guard !pendingOverlayRefresh else {
+			return
+		}
+		pendingOverlayRefresh = true
+		DispatchQueue.main.async { [weak self] in
+			guard let self else {
+				return
+			}
+			pendingOverlayRefresh = false
+			updateCheckerboardViewIfNeeded()
+			onVideoBoundsChange?()
+		}
 	}
 
 	// TODO: This should be an AsyncSequence.
@@ -437,11 +516,19 @@ final class TrimmingAVPlayerView: AVPlayerView {
 			}
 	}
 
-	fileprivate func setupTrimmingObserver() {
+	fileprivate func setupTrimmingObserver(onReady: @escaping () -> Void) {
 		trimmingCancellable = Task {
 			do {
-				try await activateTrimming()
+				// Replacing a speed-adjusted player item can preserve the existing
+				// trim session. In that state canBeginTrimming stays false because
+				// trimming is already active; waiting for it would never restore
+				// the imported range to the player or its existing handles.
+				if nativeTrimView == nil {
+					try await activateTrimming()
+				}
+				try Task.checkCancellation()
 				hideTrimButtons()
+				onReady()
 				window?.makeFirstResponder(self)
 			} catch is CancellationError {
 				// Task was cancelled, ignore.
@@ -465,28 +552,15 @@ final class TrimmingAVPlayerView: AVPlayerView {
 
 	fileprivate func setPlayPauseButton(isEnabled: Bool) {
 		guard
-			let avTrimView = firstSubview(deep: true, where: { $0.simpleClassName == "AVTrimView" }),
+			let avTrimView = nativeTrimView,
 			let superview = avTrimView.superview
 		else {
 			return
 		}
 
-		let playPauseButton = superview
-			.subviews
-			.first { $0 != avTrimView }?
-			.subviews
-			.first {
-				guard
-					let button = ($0 as? NSButton),
-					button.action?.description == "playPauseButtonPressed:"
-				else {
-					return false
-				}
-
-				return true
-			} as? NSButton
-
-		guard let playPauseButton else {
+		guard let playPauseButton = superview.firstSubview(deep: true, where: {
+			($0 as? NSButton)?.action?.description == "playPauseButtonPressed:"
+		}) as? NSButton else {
 			return
 		}
 
@@ -496,7 +570,7 @@ final class TrimmingAVPlayerView: AVPlayerView {
 	fileprivate func hideTrimButtons() {
 		// This method is a collection of hacks, so it might be acting funky on different OS versions.
 		guard
-			let avTrimView = firstSubview(deep: true, where: { $0.simpleClassName == "AVTrimView" }),
+			let avTrimView = nativeTrimView,
 			let superview = avTrimView.superview
 		else {
 			return
@@ -551,13 +625,14 @@ final class TrimmingAVPlayerView: AVPlayerView {
 		}
 
 		// Large videos can become ready before AVPlayer has computed `videoBounds`. Wait for a real rect so the checkerboard does not cover the whole player.
-		let clearRect = videoBounds
+		let convertedRect = contentOverlayView.convert(videoBounds, from: self)
+		let clearRect = Self.checkerboardClearRect(convertedRect, in: contentOverlayView.bounds, isFlipped: contentOverlayView.isFlipped)
 		guard !clearRect.isEmpty else {
 			return
 		}
 
 		let existingCheckerboardViews = contentOverlayView.subviews.filter { $0.identifier == Self.checkerboardViewIdentifier }
-		let needsNewCheckerboardView = clearRect != checkerboardVideoBounds || existingCheckerboardViews.isEmpty
+		let needsNewCheckerboardView = clearRect != checkerboardVideoBounds || contentOverlayView.bounds != checkerboardContainerBounds || existingCheckerboardViews.isEmpty
 		guard needsNewCheckerboardView else {
 			return
 		}
@@ -571,6 +646,17 @@ final class TrimmingAVPlayerView: AVPlayerView {
 		contentOverlayView.addSubview(overlayView)
 		overlayView.constrainEdgesToSuperview()
 		checkerboardVideoBounds = clearRect
+		checkerboardContainerBounds = contentOverlayView.bounds
+	}
+
+	/// SwiftUI positions use top-left coordinates, independently of the AppKit host.
+	static func checkerboardClearRect(_ rect: CGRect, in bounds: CGRect, isFlipped: Bool) -> CGRect {
+		CGRect(
+			x: rect.minX - bounds.minX,
+			y: isFlipped ? rect.minY - bounds.minY : bounds.maxY - rect.maxY,
+			width: rect.width,
+			height: rect.height
+		)
 	}
 
 	private static let checkerboardViewIdentifier = NSUserInterfaceItemIdentifier("CheckerboardView")
@@ -579,194 +665,103 @@ final class TrimmingAVPlayerView: AVPlayerView {
 	Prevent user from dismissing trimming view.
 	*/
 	override func cancelOperation(_ sender: Any?) {}
+
+	override func keyDown(with event: NSEvent) {
+		guard isTimelineInteractionEnabled else {
+			return
+		}
+		super.keyDown(with: event)
+	}
 }
 
 /**
-Passes through hits in the area occupied by `passthroughView` (the trimmer) so both the crop overlay and trimmer can coexist. When the trimmer is collapsed (off-screen), its frame is outside the visible area and all hits go to the crop overlay as normal.
+A permanently visible host for AVKit's native timeline. Disabling it prevents
+mouse, keyboard and accessibility interaction while retaining the current trim.
 */
-private class OverlayContainerView: NSView {
-	weak var passthroughView: NSView?
+private final class FixedTimelineView: NSView {
+	private var disabledControls = [(NSControl, Bool)]()
+	private var disabledAccessibility = [(any NSAccessibilityProtocol, Bool)]()
+	private var disabledElementIDs = Set<ObjectIdentifier>()
+
+	var isInteractionEnabled = true {
+		didSet {
+			if isInteractionEnabled {
+				restoreInteractionState()
+			} else {
+				disableInteraction()
+			}
+			alphaValue = isInteractionEnabled ? 1 : 0.45
+			setAccessibilityEnabled(isInteractionEnabled)
+			if oldValue != isInteractionEnabled {
+				NSAccessibility.post(element: self, notification: .layoutChanged)
+			}
+		}
+	}
+
+	// AVKit's virtual sliders can ignore enabled setters on their ancestors.
+	// Present one unavailable group while editing instead of publishing native
+	// descendants that still accept accessibility increment/set-value actions.
+	override func isAccessibilityElement() -> Bool { true }
+	override func accessibilityRole() -> NSAccessibility.Role? { .group }
+	override func accessibilityLabel() -> String? { "Timeline" }
+	override func isAccessibilityEnabled() -> Bool { isInteractionEnabled }
+	// swiftlint:disable:next discouraged_optional_collection
+	override func accessibilityChildren() -> [Any]? {
+		isInteractionEnabled ? super.accessibilityChildren() : []
+	}
+
+	override func accessibilityHitTest(_ point: CGPoint) -> Any? {
+		isInteractionEnabled ? super.accessibilityHitTest(point) : self
+	}
+
+	func restoreInteractionState() {
+		for (element, enabled) in disabledAccessibility {
+			element.setAccessibilityEnabled(enabled)
+		}
+		for (control, enabled) in disabledControls {
+			control.isEnabled = enabled
+		}
+		disabledAccessibility.removeAll()
+		disabledControls.removeAll()
+		disabledElementIDs.removeAll()
+	}
+
+	private func disableInteraction() {
+		func disable(_ element: any NSAccessibilityProtocol) {
+			guard disabledElementIDs.insert(ObjectIdentifier(element)).inserted else {
+				return
+			}
+			disabledAccessibility.append((element, element.isAccessibilityEnabled()))
+			if let control = element as? NSControl {
+				disabledControls.append((control, control.isEnabled))
+				control.isEnabled = false
+			}
+			element.setAccessibilityEnabled(false)
+			for child in element.accessibilityChildren() ?? [] {
+				if let child = child as? any NSAccessibilityProtocol {
+					disable(child)
+				}
+			}
+			if let view = element as? NSView {
+				for child in view.subviews {
+					disable(child)
+				}
+			}
+		}
+		for child in subviews {
+			disable(child)
+		}
+	}
 
 	override func hitTest(_ point: CGPoint) -> NSView? {
-		guard !subviews.isEmpty else {
-			return nil
+		guard !isInteractionEnabled else {
+			return super.hitTest(point)
 		}
-
-		if
-			let passthroughView,
-			let passthroughParent = passthroughView.superview
-		{
-			let convertedPoint = convert(point, to: passthroughParent)
-			if passthroughView.frame.contains(convertedPoint) {
-				return nil
-			}
-		}
-
-		// Only claim hits that land on a subview (the overlay), not on empty container space.
-		// This ensures the toggle button behind the container remains clickable.
-		let result = super.hitTest(point)
-		return result === self ? nil : result
-	}
-}
-
-@MainActor
-private class CollapsibleTrimmer {
-	private let avTrimView: NSView
-	let trimmerWrapper: NSView
-	private let avTrimViewParent: NSView
-	private weak var playerView: NSView?
-	private var toggleButton: NSHostingView<ToggleButtonView>
-	private var isCollapsed = false
-	private let savedConstraints: SavedConstraints
-
-	var isCollapsible = false {
-		didSet {
-			guard isCollapsible != oldValue else {
-				return
-			}
-
-			if isCollapsible {
-				addToggleButton()
-				setCollapsed(true)
-			} else {
-				removeToggleButton()
-				setCollapsed(false)
-			}
-		}
+		return frame.contains(point) ? self : nil
 	}
 
-	init(avTrimView: NSView, avTrimViewParent: NSView, playerView: NSView) {
-		self.avTrimView = avTrimView
-		self.avTrimViewParent = avTrimViewParent
-		self.playerView = playerView
-		self.trimmerWrapper = NSView()
-		self.savedConstraints = SavedConstraints(avTrimViewParent: avTrimViewParent)
-		self.toggleButton = NSHostingView(rootView: ToggleButtonView(isCollapsed: false) {})
-
-		reparentTrimmer()
-		updateToggleButton()
-	}
-
-	/**
-	Remove the `avTrimViewParent` from its old location in the view hierarchy and wrap it in our `trimmerWrapper`.
-	*/
-	private func reparentTrimmer() {
-		guard let oldSuperview = avTrimViewParent.superview else {
-			return
-		}
-
-		avTrimViewParent.removeFromSuperview()
-
-		trimmerWrapper.translatesAutoresizingMaskIntoConstraints = false
-		trimmerWrapper.addSubview(avTrimViewParent)
-		oldSuperview.addSubview(trimmerWrapper)
-
-		avTrimViewParent.constrainEdgesToSuperview()
-		savedConstraints.apply(to: trimmerWrapper, in: oldSuperview)
-	}
-
-	private func setCollapsed(_ collapsed: Bool) {
-		isCollapsed = collapsed
-		updateToggleButton()
-
-		if collapsed {
-			bottomConstraint?.animate(to: savedConstraints.height, duration: .seconds(0.3)) { [weak self] in
-				guard
-					let self,
-					isCollapsed
-				else {
-					return
-				}
-
-				avTrimView.isHidden = true
-			}
-		} else {
-			avTrimView.isHidden = false
-			bottomConstraint?.animate(to: savedConstraints.bottomOffset, duration: .seconds(0.3))
-		}
-	}
-
-	private func updateToggleButton() {
-		toggleButton.rootView = ToggleButtonView(isCollapsed: isCollapsed) { [weak self] in
-			guard let self else {
-				return
-			}
-
-			setCollapsed(!isCollapsed)
-		}
-	}
-
-	private func addToggleButton() {
-		guard let playerView else {
-			return
-		}
-
-		// Added to playerView directly so it sits above the crop overlay.
-		playerView.addSubview(toggleButton)
-		toggleButton.translatesAutoresizingMaskIntoConstraints = false
-
-		NSLayoutConstraint.activate([
-			toggleButton.centerXAnchor.constraint(equalTo: playerView.centerXAnchor),
-			toggleButton.bottomAnchor.constraint(equalTo: trimmerWrapper.topAnchor),
-			toggleButton.widthAnchor.constraint(equalToConstant: 34),
-			toggleButton.heightAnchor.constraint(equalToConstant: 22)
-		])
-	}
-
-	private func removeToggleButton() {
-		toggleButton.removeFromSuperview()
-	}
-
-	private lazy var bottomConstraint: NSLayoutConstraint? = trimmerWrapper.getConstraintFromSuperview(attribute: .bottom)
-
-	/**
-	Captures the trimmer's original constraints before reparenting, so the wrapper can be placed identically.
-	*/
-	@MainActor
-	private struct SavedConstraints {
-		let bottomOffset: Double
-		let leadingOffset: Double
-		let trailingOffset: Double
-		let height: Double
-
-		init(avTrimViewParent: NSView) {
-			self.bottomOffset = -(avTrimViewParent.getConstraintConstantFromSuperView(attribute: .bottom) ?? 6.0)
-			self.leadingOffset = avTrimViewParent.getConstraintConstantFromSuperView(attribute: .leading) ?? 6.0
-			self.trailingOffset = -(avTrimViewParent.getConstraintConstantFromSuperView(attribute: .trailing) ?? 6.0)
-			self.height = avTrimViewParent.getConstraintConstantFromSuperView(attribute: .height) ?? 64.0
-		}
-
-		func apply(to newView: NSView, in superview: NSView) {
-			NSLayoutConstraint.activate([
-				newView.leadingAnchor.constraint(equalTo: superview.leadingAnchor, constant: leadingOffset),
-				newView.bottomAnchor.constraint(equalTo: superview.bottomAnchor, constant: bottomOffset),
-				newView.trailingAnchor.constraint(equalTo: superview.trailingAnchor, constant: trailingOffset),
-				newView.heightAnchor.constraint(equalToConstant: height)
-			])
-		}
-	}
-
-	private struct ToggleButtonView: View {
-		@State private var isHovered = false
-
-		let isCollapsed: Bool
-		let action: () -> Void
-
-		var body: some View {
-			Button("Toggle Trimmer", systemImage: isCollapsed ? "chevron.compact.up" : "chevron.compact.down", action: action)
-				.labelStyle(.iconOnly)
-				.font(.system(size: 16, weight: .bold))
-				.foregroundStyle(.white.opacity(0.8))
-				.fillFrame()
-				.contentShape(.rect)
-				.buttonStyle(.plain)
-				.background(
-					Capsule()
-						.fill(.white.opacity(isHovered ? 0.2 : 0.05))
-				)
-				.onHover {
-					isHovered = $0
-				}
-		}
-	}
+	override func mouseDown(with event: NSEvent) {}
+	override func rightMouseDown(with event: NSEvent) {}
+	override func scrollWheel(with event: NSEvent) {}
+	override func keyDown(with event: NSEvent) {}
 }

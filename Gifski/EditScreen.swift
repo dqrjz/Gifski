@@ -619,11 +619,15 @@ private struct _EditScreen: View {
 			loopPlayback: loopGIF,
 			bouncePlayback: bounceGIF,
 			speed: previewPaused ? 0.0 : 1.0,
-			overlay: appState.shouldShowPreview ? nil : overlay,
+			overlay: playerOverlay,
 			isPlayPauseButtonEnabled: !previewPaused,
-			isTrimmerCollapsible: appState.isCropActive
+			isTimelineEnabled: !appState.isCropActive && appState.mode != .editText && !isImportingProject,
+			requestedTimeRange: requestedProjectTrim
 		) { timeRange in
 			DispatchQueue.main.async {
+				guard !isImportingProject else {
+					return
+				}
 				guard self.timeRange != timeRange else {
 					return
 				}
