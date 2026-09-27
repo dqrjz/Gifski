@@ -98,6 +98,7 @@ struct SettingsForFullPreview: Equatable, Sendable {
 			let dimensions: (width: Int, height: Int)?
 			let crop: CropRect?
 			let trackPreferredTransform: CGAffineTransform?
+			let textOverlays: [TextOverlay]
 
 			var loop: Gifski.Loop {
 				.never
@@ -116,7 +117,8 @@ struct SettingsForFullPreview: Equatable, Sendable {
 				quality: conversion.quality,
 				dimensions: conversion.dimensions,
 				crop: conversion.crop,
-				trackPreferredTransform: conversion.trackPreferredTransform
+				trackPreferredTransform: conversion.trackPreferredTransform,
+				textOverlays: conversion.textOverlays
 			)
 		}
 
@@ -134,7 +136,8 @@ struct SettingsForFullPreview: Equatable, Sendable {
 				loop: settings.loop,
 				bounce: settings.bounce,
 				crop: settings.crop,
-				trackPreferredTransform: settings.trackPreferredTransform
+				trackPreferredTransform: settings.trackPreferredTransform,
+				textOverlays: settings.textOverlays
 			)
 		}
 	}

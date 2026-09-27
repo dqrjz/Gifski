@@ -20,6 +20,16 @@ struct AppMain: App {
 		.defaultPosition(.center)
 		.restorationBehavior(.disabled)
 		.commands {
+			if appState.mode == .editText {
+				CommandGroup(replacing: .undoRedo) {
+					Button("Undo") { appState.onUndoText?() }
+						.keyboardShortcut("z", modifiers: .command)
+						.disabled(!appState.canUndoText)
+					Button("Redo") { appState.onRedoText?() }
+						.keyboardShortcut("z", modifiers: [.command, .shift])
+						.disabled(!appState.canRedoText)
+				}
+			}
 			CommandGroup(replacing: .newItem) {
 				Button("Open…", systemImage: "arrow.up.forward.square") {
 					appState.isFileImporterPresented = true
@@ -32,7 +42,8 @@ struct AppMain: App {
 					appState.onExportAsVideo?()
 				}
 				.keyboardShortcut("e")
-				.disabled(!appState.isOnEditScreen)
+				.disabled(!appState.isOnEditScreen || appState.hasTextOverlays)
+				.help(appState.hasTextOverlays ? "Text overlays are supported in GIF export only." : "Export the edited video")
 			}
 			CommandGroup(replacing: .textEditing) {
 				Toggle(

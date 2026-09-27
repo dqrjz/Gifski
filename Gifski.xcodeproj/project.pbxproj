@@ -130,6 +130,16 @@
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		AABBCCDDEEFF001122334456 /* Project */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Project;
+			sourceTree = "<group>";
+		};
+		AABBCCDDEEFF001122334455 /* Text */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Text;
+			sourceTree = "<group>";
+		};
 		E31053F12DCBD2EA008B7E7F /* Crop */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = Crop;
@@ -252,6 +262,8 @@
 				85A5C44722CA41B500CAA94D /* VideoValidator.swift */,
 				E3961F7F2AC9F2A700708EB7 /* Intents.swift */,
 				E31053F12DCBD2EA008B7E7F /* Crop */,
+				AABBCCDDEEFF001122334455 /* Text */,
+				AABBCCDDEEFF001122334456 /* Project */,
 				E31053F82DCBD325008B7E7F /* Components */,
 				E39128F52E0DF96C0010E6CF /* Preview */,
 				E3D08F6D1E5D7BFD00F465DF /* Utilities.swift */,
@@ -318,6 +330,8 @@
 			);
 			fileSystemSynchronizedGroups = (
 				E31053F12DCBD2EA008B7E7F /* Crop */,
+				AABBCCDDEEFF001122334455 /* Text */,
+				AABBCCDDEEFF001122334456 /* Project */,
 				E31053F82DCBD325008B7E7F /* Components */,
 				E39128F52E0DF96C0010E6CF /* Preview */,
 			);

@@ -359,6 +359,14 @@ actor GIFGenerator {
 
 		var frameNumber = 0
 		var previousSampleBuffer = firstSampleBuffer
+		// Render static text once per conversion, after the reader has applied crop, size, and orientation.
+		let textLayer: TextOverlayRenderer.Layer?
+		if conversion.textOverlays.contains(where: \.hasVisibleText) {
+			let firstImage = try cgImage(from: firstSampleBuffer)
+			textLayer = try TextOverlayRenderer.render(conversion.textOverlays, width: firstImage.width, height: firstImage.height)
+		} else {
+			textLayer = nil
+		}
 
 		while frameNumber < frameTimes.count {
 			try Task.checkCancellation()
@@ -372,7 +380,7 @@ actor GIFGenerator {
 
 			if sampleTime > frameTimes[frameNumber] {
 				// `AVAssetReader` emits composed frames, while `frameTimes` are the GIF output times. Use the previous decoded sample for every target time before the current output frame.
-				let image = try cgImage(from: previousSampleBuffer)
+				let image = try TextOverlayRenderer.composite(textLayer, onto: cgImage(from: previousSampleBuffer))
 
 				while
 					frameNumber < frameTimes.count,
@@ -399,7 +407,7 @@ actor GIFGenerator {
 			try throwIfReaderFailedOrWasCancelled(reader)
 
 			// The requested GIF can include the exact end time, which may be after the last decoded sample. Reuse the final source frame for any remaining target times.
-			let image = try cgImage(from: previousSampleBuffer)
+			let image = try TextOverlayRenderer.composite(textLayer, onto: cgImage(from: previousSampleBuffer))
 
 			while frameNumber < frameTimes.count {
 				try addFrame(
@@ -549,6 +557,9 @@ extension GIFGenerator {
 		var loopDelay = 0.0
 		var crop: CropRect?
 		var trackPreferredTransform: CGAffineTransform?
+		var textOverlays = [TextOverlay]()
+		var projectData: Data?
+		var expectedGIFSHA256: String?
 	}
 }
 

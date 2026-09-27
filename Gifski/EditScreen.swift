@@ -58,6 +58,14 @@ private struct _EditScreen: View {
 	@State private var fullPreviewDebouncer = Debouncer(delay: .milliseconds(200))
 	@State private var isPreparingConversion = false
 	@State private var backgroundWorkRequestID = 0
+	@State private var textSession = TextEditingSession()
+	@State private var textCanvas = TextOverlayCanvas()
+	@State private var isTextClipped = false
+	@State private var isProjectImporterPresented = false
+	@State private var isImportingProject = false
+	@State private var importedProject: GIFProject?
+	@State private var projectImportGeneration = UUID()
+	@State private var requestedProjectTrim: TrimmingAVPlayer.TimeRangeRequest?
 
 	@Binding private var outputCropRect: CropRect
 	@State private var savedCropEditState: (cropRect: CropRect, resizableDimensions: Dimensions)?
@@ -79,15 +87,20 @@ private struct _EditScreen: View {
 		self._asset = .init(wrappedValue: asset)
 		self._modifiedAsset = .init(wrappedValue: asset)
 		self._metadata = .init(wrappedValue: metadata)
+		self._resizableDimensions = .init(wrappedValue: .pixels(metadata.dimensions, originalSize: metadata.dimensions))
 		self._outputCropRect = outputCropRect
 		self.overlay = overlay
 		self.fullPreviewStream = fullPreviewStream
 	}
 
-	var body: some View {
+	private var editorContent: some View {
 		VStack {
 			trimmingAVPlayer
-			controls
+			if appState.mode == .editText {
+				textInspector
+			} else {
+				controls
+			}
 			bottomBar
 			ExportModifiedVideoView(
 				state: $exportModifiedVideoState,
@@ -100,7 +113,14 @@ private struct _EditScreen: View {
 		.navigationDocument(url)
 		.toolbar {
 			ToolbarSpacer(.fixed)
-			if !appState.isCropActive {
+			if appState.mode != .editText, !appState.isCropActive {
+				ToolbarItem {
+					Button("Import Project", systemImage: "doc.badge.arrow.up") { isProjectImporterPresented = true }
+						.help("Restore settings from a Gifski project (JSON)")
+						.disabled(isImportingProject || isPreparingConversion)
+				}
+			}
+			if !appState.isCropActive, appState.mode != .editText {
 				ToolbarItem {
 					Toggle(
 						"Preview",
@@ -130,6 +150,21 @@ private struct _EditScreen: View {
 			}
 			ToolbarSpacer(.fixed)
 			ToolbarItemGroup {
+				if appState.mode == .editText {
+					Button("Undo", systemImage: "arrow.uturn.backward") { textSession.undo() }
+						.disabled(!textSession.canUndo)
+					Button("Redo", systemImage: "arrow.uturn.forward") { textSession.redo() }
+						.disabled(!textSession.canRedo)
+					Button("Cancel") { cancelTextMode() }
+					Button("Done") { appState.mode = .normal }
+						.keyboardShortcut(.return, modifiers: .command)
+				} else {
+					Toggle("Text", systemImage: "textformat", isOn: appState.toggleMode(mode: .editText))
+						.help("Add and edit text")
+				}
+			}
+			if appState.mode != .editText {
+			ToolbarItemGroup {
 				CropToolbarItems(
 					isCropActive: appState.toggleMode(mode: .editCrop),
 					metadata: metadata,
@@ -138,7 +173,12 @@ private struct _EditScreen: View {
 				)
 				.focusSection()
 			}
+			}
 		}
+	}
+
+	private var settingsContent: some View {
+		editorContent
 		.onReceive(Defaults.publisher(.outputSpeed, options: [])) { _ in
 			Debouncer.debounce(delay: .seconds(0.4)) {
 				Task {
@@ -157,6 +197,16 @@ private struct _EditScreen: View {
 		// TODO: Make these a single call when tuples are equatable.
 		.onChange(of: resizableDimensions) {
 			updateBackgroundWorkOnSettingsChange()
+		}
+		.onChange(of: textSession.historyVersion) {
+			appState.canUndoText = textSession.canUndo
+			appState.canRedoText = textSession.canRedo
+		}
+		.onChange(of: textSession.overlays) {
+			appState.hasTextOverlays = !textSession.visibleOverlays.isEmpty
+			if appState.mode != .editText {
+				updateBackgroundWorkOnSettingsChange()
+			}
 		}
 		.onChange(of: timeRange) {
 			updateBackgroundWorkOnSettingsChange()
@@ -181,6 +231,10 @@ private struct _EditScreen: View {
 		.onChange(of: loopDelay) {
 			updateBackgroundWorkOnSettingsChange()
 		}
+	}
+
+	var body: some View {
+		settingsContent
 		.alert2(
 			"Reverse Playback Preview Limitation",
 			message: "Reverse playback may stutter when the video has a low keyframe rate. The GIF will not have the same stutter.",
@@ -201,10 +255,16 @@ private struct _EditScreen: View {
 		.opacity(shouldShow ? 1 : 0)
 		.onAppear {
 			setUp()
+			appState.hasTextOverlays = !textSession.visibleOverlays.isEmpty
 			appState.onExportAsVideo = onExportAsVideo
 		}
 		.onDisappear {
+			textSession.finish(cancelled: true)
+			appState.mode = .normal
 			appState.onExportAsVideo = nil
+			appState.hasTextOverlays = false
+			appState.onUndoText = nil
+			appState.onRedoText = nil
 
 			switch exportModifiedVideoState {
 			case .idle:
@@ -228,10 +288,17 @@ private struct _EditScreen: View {
 			}
 		}
 		.onKeyboardShortcut(.escape, modifiers: []) {
-			if appState.isCropActive {
+			if appState.mode == .editText {
+				cancelTextMode()
+			} else if appState.isCropActive {
 				cancelCropMode()
 			}
 		}
+	}
+
+	private func cancelTextMode() {
+		textSession.finish(cancelled: true)
+		appState.mode = .normal
 	}
 
 	private func cancelCropMode() {
@@ -244,6 +311,10 @@ private struct _EditScreen: View {
 	}
 
 	private func onExportAsVideo() {
+		guard textSession.visibleOverlays.isEmpty else {
+			NSAlert.showModal(for: SSApp.swiftUIMainWindow, title: "Text is supported in GIF export only.", message: "Remove the text to export a video, or use Convert to create a GIF with text.")
+			return
+		}
 		switch exportModifiedVideoState {
 		case .idle:
 			break
@@ -295,7 +366,7 @@ private struct _EditScreen: View {
 	}
 
 	private var canRunBackgroundWork: Bool {
-		appState.isOnEditScreen && !isPreparingConversion
+		appState.isOnEditScreen && !isPreparingConversion && appState.mode != .editText
 	}
 
 	private var canGenerateFullPreview: Bool {
@@ -475,8 +546,46 @@ private struct _EditScreen: View {
 		appState.shouldShowPreview && fullPreviewState.isGenerating
 	}
 
+	private var selectedTextBinding: Binding<TextOverlay> {
+		Binding(get: { textSession.selectedOverlay ?? TextOverlay() }, set: { textSession.update($0) })
+	}
+
+	private var textInspector: some View {
+		VStack(spacing: 2) {
+			HStack(spacing: 8) {
+				Picker("Text", selection: Binding(get: { textSession.selectedID }, set: { textSession.select($0) })) {
+					if textSession.overlays.isEmpty { Text("No text").tag(UUID?.none) }
+					ForEach(Array(textSession.overlays.enumerated()), id: \.element.id) { index, layer in
+						Text("\(index + 1). \(layer.text.isEmpty ? "Empty text" : String(layer.text.replacingOccurrences(of: "\n", with: " ").prefix(32)))")
+							.tag(Optional(layer.id))
+					}
+				}
+				Button("Add Text", systemImage: "plus") { textSession.add() }.labelStyle(.iconOnly)
+				Button("Delete Text", systemImage: "minus") { textSession.deleteSelected() }
+					.labelStyle(.iconOnly)
+					.disabled(textSession.selectedOverlay == nil)
+			}
+			.padding(.horizontal, 8)
+			if textSession.selectedOverlay != nil {
+				TextInspector(session: textSession, overlay: selectedTextBinding, outputHeight: max(1, resizableDimensions.pixels.height), isClipped: isTextClipped)
+			} else {
+				Text("Add a text box to get started.").foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 174)
+			}
+		}
+	}
+
+	private var playerOverlay: NSView? {
+		if appState.shouldShowPreview {
+			return nil
+		}
+		if appState.isCropActive || (textSession.visibleOverlays.isEmpty && appState.mode != .editText) {
+			return overlay
+		}
+		textCanvas.update(session: textSession, outputSize: resizableDimensions.pixels, crop: outputCropRect, editable: appState.mode == .editText) { isTextClipped = $0 }
+		return textCanvas
+	}
+
 	private var trimmingAVPlayer: some View {
-		// TODO: Move the trimmer outside the video view.
 		TrimmingAVPlayer(
 			asset: modifiedAsset,
 			shouldShowPreview: appState.shouldShowPreview,
@@ -497,7 +606,20 @@ private struct _EditScreen: View {
 				updateBackgroundWorkOnSettingsChange()
 			}
 		}
-		.onChange(of: appState.mode) {
+		.onChange(of: appState.mode) { oldMode, newMode in
+			if newMode == .editText {
+				textSession.begin()
+				appState.onUndoText = { textSession.undo() }
+				appState.onRedoText = { textSession.redo() }
+				updateBackgroundWorkOnSettingsChange()
+			}
+			if oldMode == .editText {
+				textSession.finish(cancelled: false)
+				appState.onUndoText = nil
+				appState.onRedoText = nil
+				appState.hasTextOverlays = !textSession.visibleOverlays.isEmpty
+				updateBackgroundWorkOnSettingsChange()
+			}
 			if appState.mode == .editCrop {
 				// Crop edits can shrink `resizableDimensions` live through `croppedMaximumSize`, so cancel needs to restore both pieces of edit-session state.
 				savedCropEditState = (outputCropRect, resizableDimensions)
@@ -556,7 +678,7 @@ private struct _EditScreen: View {
 				convert()
 			}
 			.keyboardShortcut(.defaultAction)
-			.disabled(!hasEnoughFrames || isPreparingConversion)
+			.disabled(!hasEnoughFrames || isPreparingConversion || appState.mode == .editText)
 			.padding(.top, -1) // Makes the bar have equal spacing on top and bottom.
 		}
 		.overlay {
@@ -659,7 +781,8 @@ private struct _EditScreen: View {
 			loopDelay: Defaults[.loopDelay],
 			// `CGImage.cropping(to:)` is expensive for 4K frames, so keep the no-crop path as `nil`.
 			crop: outputCropRect.isReset ? nil : outputCropRect,
-			trackPreferredTransform: metadata.trackPreferredTransform
+			trackPreferredTransform: metadata.trackPreferredTransform,
+			textOverlays: textSession.visibleOverlays
 		)
 	}
 

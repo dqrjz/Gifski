@@ -70,6 +70,7 @@ final class AppState {
 	enum Mode {
 		case normal
 		case editCrop
+		case editText
 		case preview
 	}
 
@@ -82,6 +83,12 @@ final class AppState {
 	var isCropActive: Bool {
 		mode == .editCrop
 	}
+
+	var hasTextOverlays = false
+	var canUndoText = false
+	var canRedoText = false
+	var onUndoText: (() -> Void)?
+	var onRedoText: (() -> Void)?
 
 	var onExportAsVideo: (() -> Void)?
 
