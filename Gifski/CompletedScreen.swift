@@ -7,6 +7,7 @@ struct CompletedScreen: View {
 	@Environment(\.requestReview) private var requestReview
 	@AppStorage("conversionCount") private var conversionCount = 0
 	@State private var isFileExporterPresented = false
+	@State private var isProjectExporterPresented = false
 	@State private var isShowingContent = false
 	@State private var isCopyWarning1Presented = false
 	@State private var isCopyWarning2Presented = false
@@ -15,6 +16,7 @@ struct CompletedScreen: View {
 	let data: Data
 	let url: URL
 	let sourceURL: URL
+	let projectData: Data?
 
 	var body: some View {
 		VStack {
@@ -56,6 +58,17 @@ struct CompletedScreen: View {
 		}
 		.fileDialogDefaultDirectory(saveDialogDirectory)
 		.fileDialogMessage("Choose where to save the GIF")
+		.fileDialogConfirmationLabel("Save")
+		.fileExporter(
+			isPresented: $isProjectExporterPresented,
+			document: projectData.map { GIFProjectDocument(data: $0) },
+			contentType: .json,
+			defaultFilename: url.filenameWithoutExtension + ".gifski.json"
+		) { result in
+			if case .failure(let error) = result { appState.error = error }
+		}
+		.fileDialogDefaultDirectory(saveDialogDirectory)
+		.fileDialogMessage("Choose where to save the JSON project")
 		.fileDialogConfirmationLabel("Save")
 		.alert2(
 			"The GIF was copied to the clipboard.",
@@ -100,11 +113,17 @@ struct CompletedScreen: View {
 
 	private var controls: some View {
 		HStack(spacing: 16) {
-			Button("Save", systemImage: "square.and.arrow.down") {
+			Button("Save GIF", systemImage: "square.and.arrow.down") {
 				isFileExporterPresented = true
 			}
 			.keyboardShortcut("s")
-			.help("Save")
+			.help("Save GIF")
+			if projectData != nil {
+				Button("Save Project", systemImage: "doc.badge.gearshape") {
+					isProjectExporterPresented = true
+				}
+				.help("Save Project (JSON)")
+			}
 			CopyButton {
 				copyToClipboard(url)
 			}
@@ -119,7 +138,7 @@ struct CompletedScreen: View {
 		.controlSize(.extraLarge)
 		.buttonStyle(.equalWidth(.constant(0), minimumWidth: 80))
 		.buttonStyle(.glass)
-		.frame(width: 300)
+		.frame(width: projectData == nil ? 300 : 400)
 		.padding()
 		.opacity(isShowingContent ? 1 : 0)
 	}

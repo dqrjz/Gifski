@@ -95,6 +95,17 @@ struct ConversionScreen: View {
 
 		try Task.checkCancellation()
 
+		let digest = GIFProject.sha256(of: data)
+		if let expected = conversion.expectedGIFSHA256, expected != digest {
+			throw NSError(domain: "GIFProject", code: 1, userInfo: [NSLocalizedDescriptionKey: "The regenerated GIF does not exactly match the saved project. The file was not exported. Check that the video, fonts, and rendering environment have not changed."])
+		}
+		var projectData = conversion.projectData
+		if let snapshot = projectData {
+			var project = try GIFProject.decode(snapshot)
+			project.expectedGIFSHA256 = digest
+			projectData = try project.encoded()
+		}
+
 		let filename = conversion.sourceURL.filenameWithoutExtension
 		let url = try data.writeToUniqueTemporaryFile(filename: filename, contentType: .gif)
 		autoSaveToDownloadsIfNeeded(data, filename: filename)
@@ -111,7 +122,7 @@ struct ConversionScreen: View {
 		// This works around some race issue where it would sometimes end up with edit screen after conversion.
 		var path = appState.navigationPath
 		path.removeLast()
-		path.append(.completed(data, url, sourceURL: conversion.sourceURL))
+		path.append(.completed(data, url, sourceURL: conversion.sourceURL, projectData: projectData))
 		appState.navigationPath = path
 	}
 

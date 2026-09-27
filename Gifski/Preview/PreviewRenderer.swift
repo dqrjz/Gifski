@@ -4,17 +4,22 @@ import MetalKit
 
 actor PreviewRenderer {
 	private static var sharedRenderer: PreviewRenderer?
+	private static let sharedRendererLock = NSLock()
 
 	static var shared: PreviewRenderer {
 		get throws {
-			if let sharedRenderer {
-				return sharedRenderer
+			// Static storage is not isolated by an actor instance. AVFoundation can
+			// request several first frames concurrently, including from different
+			// compositors, so creation and retention must be protected together.
+			try sharedRendererLock.withLock {
+				if let sharedRenderer {
+					return sharedRenderer
+				}
+
+				let renderer = try PreviewRenderer()
+				sharedRenderer = renderer
+				return renderer
 			}
-
-			let renderer = try PreviewRenderer()
-			sharedRenderer = renderer
-
-			return renderer
 		}
 	}
 

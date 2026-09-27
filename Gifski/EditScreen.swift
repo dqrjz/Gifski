@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import UniformTypeIdentifiers
 
 struct EditScreen: View {
 	@Environment(AppState.self) private var appState
@@ -108,6 +109,20 @@ private struct _EditScreen: View {
 				isAudioWarningPresented: $isExportModifiedVideoAudioWarningPresented
 			)
 		}
+		.disabled(isImportingProject || isPreparingConversion)
+		.overlay {
+			if isImportingProject { ProgressView("Restoring project…").padding().background(.regularMaterial, in: .rect(cornerRadius: 8)) }
+		}
+		.fileImporter(isPresented: $isProjectImporterPresented, allowedContentTypes: [.json]) { result in
+			switch result {
+			case .success(let file):
+				importProject(from: file)
+			case .failure(let error):
+				appState.error = error
+			}
+		}
+		.fileDialogMessage("Choose the JSON project for this video")
+		.fileDialogConfirmationLabel("Import")
 		.background(.ultraThickMaterial)
 		.navigationTitle(url.lastPathComponent)
 		.navigationDocument(url)
@@ -385,6 +400,9 @@ private struct _EditScreen: View {
 	}
 
 	private func updateBackgroundWorkOnSettingsChange() {
+		guard !isImportingProject else {
+			return
+		}
 		updateEstimatedFileSize()
 		updatePreviewOnSettingsChange()
 	}
@@ -432,6 +450,9 @@ private struct _EditScreen: View {
 	}
 
 	private func setSpeed() async {
+		guard !isImportingProject else {
+			return
+		}
 		do {
 			try await applySelectedSpeed()
 		} catch {
@@ -469,6 +490,7 @@ private struct _EditScreen: View {
 		_ speed: Double,
 		updateBackgroundWork: Bool = true
 	) async throws -> Bool {
+		let importGeneration = projectImportGeneration
 		if speed == lastSpeed {
 			return true
 		}
@@ -498,6 +520,10 @@ private struct _EditScreen: View {
 		let modifiedAsset = try await PreviewableComposition(asset: speedAdjustedAsset)
 		let modifiedAssetTimeRange = try await modifiedAsset.firstVideoTrack?.load(.timeRange)
 		let timeRange = translatedTimeRange(from: oldModifiedAssetTimeRange, to: modifiedAssetTimeRange)
+
+		guard importGeneration == projectImportGeneration else {
+			return true
+		}
 
 		// A newer speed request may have started while this one was extracting. Do not let stale AVFoundation work overwrite the current UI state.
 		guard speed == Defaults[.outputSpeed] else {
@@ -794,7 +820,7 @@ private struct _EditScreen: View {
 			}
 
 			do {
-				let conversion = try await prepareConversionSettings()
+				var conversion = try await prepareConversionSettings()
 
 				guard appState.isOnEditScreen else {
 					return
@@ -821,6 +847,17 @@ private struct _EditScreen: View {
 					return
 				}
 
+				let project = try await GIFProject.create(
+					sourceURL: url,
+					metadata: metadata,
+					conversion: conversion,
+					speed: Defaults[.outputSpeed],
+					textOverlays: textSession.overlays
+				)
+				conversion.projectData = try project.encoded()
+				if let importedProject, importedProject.settings == project.settings {
+					conversion.expectedGIFSHA256 = importedProject.expectedGIFSHA256
+				}
 				appState.navigationPath.append(.conversion(conversion))
 			} catch {
 				appState.error = error

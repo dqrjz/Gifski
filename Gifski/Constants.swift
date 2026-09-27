@@ -22,7 +22,7 @@ extension Defaults.Keys {
 enum Route: Hashable {
 	case edit(URL, AVAsset, AVAsset.VideoMetadata)
 	case conversion(GIFGenerator.Conversion)
-	case completed(Data, URL, sourceURL: URL)
+	case completed(Data, URL, sourceURL: URL, projectData: Data?)
 }
 
 struct ExportableGIF: Transferable {

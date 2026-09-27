@@ -7,7 +7,56 @@ import UniformTypeIdentifiers
 import VideoToolbox
 @testable import Gifski
 
+// AVAssetReader blocks waiting for the async video compositor. Running many readers
+// concurrently can exhaust the cooperative thread pool before compositor work runs.
+@Suite(.serialized)
 struct Tests {
+	@Test
+	@MainActor
+	func projectRoundTripReproducesExactGIFAndRejectsInvalidSource() async throws {
+		let url = try await makeTestVideo(frameCount: 8, dimensions: (320, 180)) { _ in try makeAsymmetricTextTestBuffer() }
+		let original = AVURLAsset(url: url)
+		let metadata = try #require(try await original.videoMetadata)
+		let track = try #require(try await original.firstVideoTrack)
+		let adjusted = try #require(try await track.extractToNewAssetAndChangeSpeed(to: 2))
+		let previewable = try await PreviewableComposition(asset: adjusted)
+		let conversion = GIFGenerator.Conversion(asset: previewable, sourceURL: url, timeRange: 0.1...1.2, quality: 0.8, dimensions: (100, 90), frameRate: 4, loop: .count(3), bounce: true, loopDelay: 0.2, crop: .init(x: 0.2, y: 0.1, width: 0.5, height: 0.8), trackPreferredTransform: metadata.trackPreferredTransform, textOverlays: [TextOverlay(text: "工程重现")])
+		let first = try await GIFGenerator().run(conversion) { _ in }
+		let project = try await GIFProject.create(sourceURL: url, metadata: metadata, conversion: conversion, speed: 2, expectedGIFSHA256: GIFProject.sha256(of: first))
+		let encoded = try project.encoded()
+		let restored = try GIFProject.decode(encoded)
+		#expect(restored == project)
+		#expect(restored.settings.sourceTrim.start == 0.2)
+		#expect(restored.settings.sourceTrim.end == 2.4)
+		let relocated = url.deletingLastPathComponent().appending(path: "moved.mov")
+		try FileManager.default.copyItem(at: url, to: relocated)
+		try await restored.validate(sourceURL: relocated, metadata: metadata)
+		let relocatedAsset = AVURLAsset(url: relocated)
+		let restoredTrack = try #require(try await relocatedAsset.firstVideoTrack)
+		let restoredAsset = try #require(try await restoredTrack.extractToNewAssetAndChangeSpeed(to: restored.settings.speed))
+		let restoredPreviewable = try await PreviewableComposition(asset: restoredAsset)
+		let second = try await GIFGenerator().run(restored.settings.conversion(asset: restoredPreviewable, sourceURL: relocated)) { _ in }
+		#expect(first == second)
+		#expect(GIFProject.sha256(of: second) == restored.expectedGIFSHA256)
+		var invalid = restored
+		invalid.version += 1
+		#expect(throws: GIFProject.Error.self) { try invalid.encoded() }
+		invalid = restored
+		invalid.settings.adjustedTrim.start = -1
+		#expect(throws: GIFProject.Error.self) { try invalid.encoded() }
+		invalid = restored
+		invalid.settings.width = Int.max
+		#expect(throws: GIFProject.Error.self) { try invalid.encoded() }
+		invalid = restored
+		invalid.compatibility.fonts[0].fileSHA256 = String(repeating: "0", count: 64)
+		await #expect(throws: GIFProject.Error.self) { try await invalid.validate(sourceURL: relocated, metadata: metadata) }
+		invalid = restored
+		invalid.compatibility.renderer = "unknown"
+		await #expect(throws: GIFProject.Error.self) { try await invalid.validate(sourceURL: relocated, metadata: metadata) }
+		try Data("changed media".utf8).write(to: relocated)
+		await #expect(throws: GIFProject.Error.self) { try await restored.validate(sourceURL: relocated, metadata: metadata) }
+	}
+
 	private func instant(afterSeconds seconds: Double, from startInstant: ContinuousClock.Instant) -> ContinuousClock.Instant {
 		startInstant.advanced(by: .seconds(seconds))
 	}
@@ -96,6 +145,8 @@ struct Tests {
 	private func makeTestVideo(
 		frameCount: Int,
 		codec: AVVideoCodecType = .h264,
+		dimensions: (width: Int, height: Int) = (16, 16),
+		transform: CGAffineTransform = .identity,
 		presentationTimeForFrame: (Int) -> CMTime = { .init(value: CMTimeValue($0), timescale: 2) },
 		pixelBufferForFrame: (Int) throws -> CVPixelBuffer
 	) async throws -> URL {
@@ -106,18 +157,19 @@ struct Tests {
 			mediaType: .video,
 			outputSettings: [
 				AVVideoCodecKey: codec,
-				AVVideoWidthKey: 16,
-				AVVideoHeightKey: 16
+				AVVideoWidthKey: dimensions.width,
+				AVVideoHeightKey: dimensions.height
 			]
 		)
 		input.expectsMediaDataInRealTime = false
+		input.transform = transform
 
 		let adaptor = AVAssetWriterInputPixelBufferAdaptor(
 			assetWriterInput: input,
 			sourcePixelBufferAttributes: [
 				kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-				kCVPixelBufferWidthKey as String: 16,
-				kCVPixelBufferHeightKey as String: 16
+				kCVPixelBufferWidthKey as String: dimensions.width,
+				kCVPixelBufferHeightKey as String: dimensions.height
 			]
 		)
 
@@ -935,6 +987,25 @@ struct Tests {
 		#expect(try await outputAsset.dimensions == .init(width: 8, height: 8))
 		#expect(try await outputAsset.load(.duration).seconds > 0)
 		try expectSamePresentationTiming(sourceTimestamps, outputTimestamps)
+	}
+
+	@Test
+	func concurrentPreviewRendererRequestsShareOneInstance() async throws {
+		let renderers = try await withThrowingTaskGroup(of: PreviewRenderer.self) { group in
+			for _ in 0..<64 {
+				group.addTask {
+					try PreviewRenderer.shared
+				}
+			}
+			var results = [PreviewRenderer]()
+			for try await renderer in group {
+				results.append(renderer)
+			}
+			return results
+		}
+		let first = try #require(renderers.first)
+		#expect(renderers.count == 64)
+		#expect(renderers.allSatisfy { $0 === first })
 	}
 
 	@Test
