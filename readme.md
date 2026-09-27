@@ -40,6 +40,17 @@ A special version for users that cannot access the App Store. It won't receive a
 
 ## Features
 
+### Gifski Studio additions
+
+This fork extends the original video-to-GIF workflow with an editor designed for creating captioned GIFs and reusable projects.
+
+- Add one or more text layers to a video before exporting. Text supports system fonts (including installed Chinese fonts), styles, size, fill color, outline color and width, alignment, text-box width, and direct positioning on the preview.
+- Choose the **240 × 240 · WeChat Sticker** preset to center-crop the current selection to a square and export it at the standard WeChat sticker size without upscaling small footage.
+- Save a `.gifski.json` project alongside a finished GIF. A project stores trim range, crop, speed, dimensions, FPS, quality, looping, text layers, source-video metadata, and font fingerprints. Import it after opening the same source video to restore the edit. When the rendering environment is compatible, re-export verification ensures the GIF bytes match the saved project.
+- The native timeline now sits below the video preview. It stays visible while text or crop editing is active, but becomes temporarily unavailable so it cannot interfere with those edits.
+
+These additions currently apply to video input and GIF export. Editing an existing GIF as source media is not supported.
+
 ### Share extension
 
 Gifski includes a share extension that lets you share videos to Gifski. Just select Gifski from the Share menu of any macOS app.
